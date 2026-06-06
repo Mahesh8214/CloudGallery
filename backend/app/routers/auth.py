@@ -168,10 +168,10 @@ async def callback(code: str, db: Session = Depends(get_db)):
         value=session_token,
         max_age=settings.JWT_EXPIRY_HOURS * 3600,
         httponly=True,
-        samesite="lax",
-        secure=False,  # Set True in production behind HTTPS
+        samesite="none",
+        secure=True,
         path="/",
-    )
+)
     return response
 
 
