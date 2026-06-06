@@ -189,3 +189,24 @@ class TrashContents(BaseModel):
     images: List[ImageResponse]
 
 
+# ── Chunked Uploads ─────────────────────────────────────────────────────
+
+class UploadInitiateRequest(BaseModel):
+    filename: str
+    folder_id: str
+    total_size: int
+    mime_type: str
+    upload_id: Optional[str] = None
+
+
+class UploadInitiateResponse(BaseModel):
+    upload_id: str
+    chunk_size: int
+    uploaded_chunks: List[int]
+
+
+class UploadCompleteRequest(BaseModel):
+    upload_id: str
+
+
+

@@ -11,6 +11,11 @@ Endpoints:
 """
 
 import logging
+import os
+import json
+import uuid
+import math
+import shutil
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, Response, Query, status
@@ -19,7 +24,14 @@ from sqlalchemy.orm import Session
 from app.database import get_db
 from app.dependencies import get_current_user, get_github_token
 from app.models import Folder, Image, User
-from app.schemas import ImageRename, ImageResponse, PaginatedImages
+from app.schemas import (
+    ImageRename,
+    ImageResponse,
+    PaginatedImages,
+    UploadInitiateRequest,
+    UploadInitiateResponse,
+    UploadCompleteRequest,
+)
 from app.services.github import GitHubService, GitHubServiceError
 from app.services.storage import StorageService
 from app.services.thumbnail import generate_thumbnail
@@ -34,6 +46,14 @@ from app.utils.validators import (
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["images"])
+
+# Chunked upload directory
+TEMP_UPLOAD_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+    "temp_uploads"
+)
+os.makedirs(TEMP_UPLOAD_DIR, exist_ok=True)
+
 
 
 # ── Upload ──────────────────────────────────────────────────────────────
@@ -145,6 +165,274 @@ async def upload_image(
     log_activity(db, user.id, "upload_image", {"image_id": image.id, "filename": filename, "path": github_path})
 
     return image
+
+
+# ── Chunked Upload Routes ───────────────────────────────────────────────
+
+@router.post("/upload/initiate", response_model=UploadInitiateResponse)
+async def initiate_upload(
+    payload: UploadInitiateRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Initiates a chunked upload.
+    If upload_id is provided, tries to find the existing session
+    and returns previously uploaded chunks.
+    """
+    if not user.repository_name or not user.repository_owner:
+        raise HTTPException(status_code=400, detail="No repository selected.")
+
+    # Validate file type
+    if not validate_file_type(payload.filename, payload.mime_type):
+        raise HTTPException(status_code=400, detail="Unsupported file type.")
+
+    if not validate_file_size(payload.total_size):
+        raise HTTPException(
+            status_code=400,
+            detail="File too large. Maximum size is 100 MB.",
+        )
+
+    # Resolve folder
+    folder = (
+        db.query(Folder)
+        .filter(Folder.id == payload.folder_id, Folder.user_id == user.id, Folder.deleted_at.is_(None))
+        .first()
+    )
+    if not folder:
+        raise HTTPException(status_code=404, detail="Folder not found.")
+
+    # Check if we can resume an existing session
+    upload_id = payload.upload_id
+    if upload_id:
+        session_dir = os.path.join(TEMP_UPLOAD_DIR, upload_id)
+        metadata_path = os.path.join(session_dir, "metadata.json")
+        if os.path.isdir(session_dir) and os.path.exists(metadata_path):
+            try:
+                with open(metadata_path, "r", encoding="utf-8") as f:
+                    meta = json.load(f)
+                # Verify that it belongs to the same user and has the same properties
+                if (
+                    meta.get("user_id") == user.id
+                    and meta.get("folder_id") == payload.folder_id
+                    and meta.get("filename") == payload.filename
+                    and meta.get("total_size") == payload.total_size
+                ):
+                    # Find which chunks have already been uploaded
+                    uploaded_chunks = []
+                    for name in os.listdir(session_dir):
+                        if name.startswith("chunk_"):
+                            try:
+                                uploaded_chunks.append(int(name.split("_")[1]))
+                            except ValueError:
+                                pass
+                    uploaded_chunks.sort()
+                    return UploadInitiateResponse(
+                        upload_id=upload_id,
+                        chunk_size=1024 * 1024,  # 1MB chunks
+                        uploaded_chunks=uploaded_chunks
+                    )
+            except Exception as e:
+                logger.warning("Failed to read existing metadata for session %s: %s", upload_id, e)
+
+    # Generate a new session
+    upload_id = str(uuid.uuid4())
+    session_dir = os.path.join(TEMP_UPLOAD_DIR, upload_id)
+    os.makedirs(session_dir, exist_ok=True)
+
+    # Sanitize filename and ensure uniqueness
+    filename = sanitize_filename(payload.filename)
+    existing_names = [img.filename for img in folder.images if img.deleted_at is None]
+    filename = generate_unique_filename(filename, existing_names)
+
+    meta = {
+        "filename": filename,
+        "folder_id": payload.folder_id,
+        "total_size": payload.total_size,
+        "mime_type": payload.mime_type,
+        "user_id": user.id,
+        "created_at": datetime.now(timezone.utc).isoformat()
+    }
+    metadata_path = os.path.join(session_dir, "metadata.json")
+    with open(metadata_path, "w", encoding="utf-8") as f:
+        json.dump(meta, f)
+
+    return UploadInitiateResponse(
+        upload_id=upload_id,
+        chunk_size=1024 * 1024,  # 1MB chunks
+        uploaded_chunks=[]
+    )
+
+
+@router.post("/upload/chunk")
+async def upload_chunk(
+    upload_id: str = Form(...),
+    chunk_index: int = Form(...),
+    file: UploadFile = File(...),
+    user: User = Depends(get_current_user),
+):
+    """
+    Uploads a single chunk for a chunked upload session.
+    """
+    session_dir = os.path.join(TEMP_UPLOAD_DIR, upload_id)
+    metadata_path = os.path.join(session_dir, "metadata.json")
+    if not os.path.isdir(session_dir) or not os.path.exists(metadata_path):
+        raise HTTPException(status_code=404, detail="Upload session not found.")
+
+    with open(metadata_path, "r", encoding="utf-8") as f:
+        meta = json.load(f)
+
+    if meta.get("user_id") != user.id:
+        raise HTTPException(status_code=403, detail="Not authorized for this upload session.")
+
+    chunk_filename = f"chunk_{chunk_index}"
+    chunk_path = os.path.join(session_dir, chunk_filename)
+
+    content = await file.read()
+    with open(chunk_path, "wb") as f:
+        f.write(content)
+
+    return {"status": "ok", "chunk_index": chunk_index}
+
+
+@router.post("/upload/complete", response_model=ImageResponse, status_code=status.HTTP_201_CREATED)
+async def complete_upload(
+    payload: UploadCompleteRequest,
+    user: User = Depends(get_current_user),
+    token: str = Depends(get_github_token),
+    db: Session = Depends(get_db),
+):
+    """
+    Assembles chunks and completes the upload, writing the final file to GitHub and DB.
+    """
+    upload_id = payload.upload_id
+    session_dir = os.path.join(TEMP_UPLOAD_DIR, upload_id)
+    metadata_path = os.path.join(session_dir, "metadata.json")
+    if not os.path.isdir(session_dir) or not os.path.exists(metadata_path):
+        raise HTTPException(status_code=404, detail="Upload session not found.")
+
+    with open(metadata_path, "r", encoding="utf-8") as f:
+        meta = json.load(f)
+
+    if meta.get("user_id") != user.id:
+        raise HTTPException(status_code=403, detail="Not authorized for this upload session.")
+
+    filename = meta["filename"]
+    folder_id = meta["folder_id"]
+    total_size = meta["total_size"]
+    mime_type = meta["mime_type"]
+
+    # Calculate total expected chunks
+    chunk_size = 1024 * 1024
+    total_chunks = math.ceil(total_size / chunk_size)
+
+    # Check for missing chunks
+    missing_chunks = []
+    for i in range(total_chunks):
+        chunk_path = os.path.join(session_dir, f"chunk_{i}")
+        if not os.path.exists(chunk_path):
+            missing_chunks.append(i)
+
+    if missing_chunks:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Missing chunks: {missing_chunks}. Upload them before completing.",
+        )
+
+    # Merge all chunks
+    content = bytearray()
+    for i in range(total_chunks):
+        chunk_path = os.path.join(session_dir, f"chunk_{i}")
+        with open(chunk_path, "rb") as f:
+            content.extend(f.read())
+
+    # Verify size
+    if len(content) != total_size:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Assembled file size ({len(content)}) does not match expected size ({total_size}).",
+        )
+
+    content_bytes = bytes(content)
+
+    # Validate type and size (safety double check)
+    if not validate_file_type(filename, mime_type):
+        raise HTTPException(status_code=400, detail="Unsupported file type.")
+    if not validate_file_size(len(content_bytes)):
+        raise HTTPException(status_code=400, detail="File too large. Maximum size is 100 MB.")
+
+    # Resolve folder
+    folder = (
+        db.query(Folder)
+        .filter(Folder.id == folder_id, Folder.user_id == user.id, Folder.deleted_at.is_(None))
+        .first()
+    )
+    if not folder:
+        raise HTTPException(status_code=404, detail="Folder not found.")
+
+    github_path = f"{folder.github_path}/{filename}"
+
+    # Generate thumbnail bytes
+    thumb_bytes = generate_thumbnail(content_bytes, mime_type)
+
+    async def db_insert_func(uploaded_sha: str, path: str) -> Image:
+        thumbnail_path = None
+        if thumb_bytes:
+            name_parts = filename.rsplit(".", 1)
+            thumb_filename = f"{name_parts[0]}_thumbnail.jpg"
+            thumb_path = f"{folder.github_path}/{thumb_filename}"
+            try:
+                await StorageService.upload_file(
+                    token=token,
+                    owner=user.repository_owner,
+                    repo=user.repository_name,
+                    path=thumb_path,
+                    content_bytes=thumb_bytes,
+                    message=f"Upload thumbnail for {filename}"
+                )
+                thumbnail_path = thumb_path
+            except Exception as e:
+                logger.error("Failed to upload thumbnail to GitHub: %s", e)
+
+        new_image = Image(
+            filename=filename,
+            folder_id=folder_id,
+            user_id=user.id,
+            github_path=path,
+            github_sha=uploaded_sha,
+            size=len(content_bytes),
+            mime_type=mime_type,
+            thumbnail_path=thumbnail_path
+        )
+        db.add(new_image)
+        return new_image
+
+    try:
+        image = await StorageService.execute_transactional_upload(
+            db=db,
+            token=token,
+            owner=user.repository_owner,
+            repo=user.repository_name,
+            path=github_path,
+            content_bytes=content_bytes,
+            message=f"Upload: {github_path}",
+            db_insert_func=db_insert_func
+        )
+    except Exception as exc:
+        logger.error("Transactional upload failed: %s", exc)
+        raise HTTPException(status_code=502, detail="Failed to upload image metadata.")
+
+    # Clean up temp folder
+    try:
+        shutil.rmtree(session_dir)
+    except Exception as cleanup_err:
+        logger.error("Failed to clean up upload session directory %s: %s", session_dir, cleanup_err)
+
+    # Audit log
+    log_activity(db, user.id, "upload_image", {"image_id": image.id, "filename": filename, "path": github_path})
+
+    return image
+
 
 
 # ── Search ──────────────────────────────────────────────────────────────

@@ -187,6 +187,96 @@ export async function uploadImage(
   });
 }
 
+export interface UploadInitiateResponse {
+  upload_id: string;
+  chunk_size: number;
+  uploaded_chunks: number[];
+}
+
+export async function initiateUpload(
+  folderId: string,
+  filename: string,
+  totalSize: number,
+  mimeType: string,
+  uploadId?: string
+): Promise<UploadInitiateResponse> {
+  return request<UploadInitiateResponse>("/images/upload/initiate", {
+    method: "POST",
+    body: JSON.stringify({
+      filename,
+      folder_id: folderId,
+      total_size: totalSize,
+      mime_type: mimeType,
+      upload_id: uploadId || null,
+    }),
+  });
+}
+
+export async function uploadChunk(
+  uploadId: string,
+  chunkIndex: number,
+  chunkBlob: Blob,
+  onProgress?: (progressEvent: { loaded: number; total: number }) => void,
+  signal?: AbortSignal
+): Promise<{ status: string; chunk_index: number }> {
+  const formData = new FormData();
+  formData.append("upload_id", uploadId);
+  formData.append("chunk_index", chunkIndex.toString());
+  formData.append("file", chunkBlob, `chunk_${chunkIndex}`);
+
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", `${API}/images/upload/chunk`);
+    xhr.withCredentials = true;
+
+    if (signal) {
+      signal.addEventListener("abort", () => {
+        xhr.abort();
+        reject(new DOMException("Aborted", "AbortError"));
+      });
+    }
+
+    if (onProgress) {
+      xhr.upload.onprogress = (event) => {
+        if (event.lengthComputable) {
+          onProgress({
+            loaded: event.loaded,
+            total: event.total,
+          });
+        }
+      };
+    }
+
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300) {
+        try {
+          resolve(JSON.parse(xhr.responseText));
+        } catch {
+          reject(new Error("Failed to parse response"));
+        }
+      } else {
+        try {
+          const errBody = JSON.parse(xhr.responseText);
+          reject(new Error(errBody.detail || `Chunk upload failed: ${xhr.status}`));
+        } catch {
+          reject(new Error(`Chunk upload failed: ${xhr.statusText}`));
+        }
+      }
+    };
+
+    xhr.onerror = () => reject(new Error("Network error during chunk upload"));
+    xhr.send(formData);
+  });
+}
+
+export async function completeUpload(uploadId: string): Promise<ImageResponse> {
+  return request<ImageResponse>("/images/upload/complete", {
+    method: "POST",
+    body: JSON.stringify({ upload_id: uploadId }),
+  });
+}
+
+
 export async function renameImage(
   id: string,
   filename: string

@@ -14,6 +14,9 @@ import {
   deleteImage,
   getImageViewUrl,
   getThumbnailUrl,
+  initiateUpload,
+  uploadChunk,
+  completeUpload,
 } from "@/app/lib/api";
 import type {
   User,
@@ -45,10 +48,16 @@ export default function FolderPage() {
     fileName: string;
     progress: number;
     speed: string;
-    status: "pending" | "uploading" | "success" | "error";
+    status: "pending" | "uploading" | "paused" | "success" | "error";
     errorMsg?: string;
+    uploadId?: string;
+    chunkIndex?: number;
+    totalChunks?: number;
   }[]>([]);
   const [error, setError] = useState("");
+
+  const filesRef = useRef<Record<string, File>>({});
+  const abortControllersRef = useRef<Record<string, AbortController>>({});
 
   // Modals — Subfolder
   const [showCreateSub, setShowCreateSub] = useState(false);
@@ -243,6 +252,11 @@ export default function FolderPage() {
 
   // File Upload Handlers — Concurrent queue with max 3 parallel uploads
   const MAX_CONCURRENT = 3;
+  const queueRef = useRef<any[]>([]);
+
+  function syncQueue() {
+    setUploadQueue([...queueRef.current]);
+  }
 
   async function handleFilesUpload(files: FileList) {
     if (files.length === 0) return;
@@ -250,110 +264,234 @@ export default function FolderPage() {
     setError("");
 
     const fileArray = Array.from(files);
-    const queueItems = fileArray.map((file, idx) => ({
-      id: `upload-${Date.now()}-${idx}`,
-      fileName: file.name,
-      progress: 0,
-      speed: "",
-      status: "pending" as const,
-    }));
+    const newItems = fileArray.map((file, idx) => {
+      const itemId = `upload-${Date.now()}-${idx}`;
+      filesRef.current[itemId] = file;
+      return {
+        id: itemId,
+        fileName: file.name,
+        progress: 0,
+        speed: "",
+        status: "pending" as const,
+      };
+    });
 
-    setUploadQueue(queueItems);
+    queueRef.current = [...queueRef.current, ...newItems];
+    syncQueue();
+    runQueue();
+  }
 
-    // Semaphore-based concurrency limiter
-    let running = 0;
-    let nextIndex = 0;
-    const results: (ImageResponse | null)[] = new Array(fileArray.length).fill(null);
-
-    await new Promise<void>((resolveAll) => {
-      function startNext() {
-        while (running < MAX_CONCURRENT && nextIndex < fileArray.length) {
-          const idx = nextIndex++;
-          running++;
-          processFile(idx).then(() => {
-            running--;
-            if (running === 0 && nextIndex >= fileArray.length) {
-              resolveAll();
-            } else {
-              startNext();
-            }
-          });
+  function runQueue() {
+    // Check if all items in queue are successfully done
+    const allDone = queueRef.current.length > 0 && queueRef.current.every(item => item.status === "success");
+    if (allDone) {
+      filesRef.current = {};
+      abortControllersRef.current = {};
+      setTimeout(() => {
+        const currentAllDone = queueRef.current.every(item => item.status === "success");
+        if (currentAllDone) {
+          setUploading(false);
+          queueRef.current = [];
+          syncQueue();
         }
+      }, 3000);
+      return;
+    }
+
+    const running = queueRef.current.filter(item => item.status === "uploading").length;
+    let slots = MAX_CONCURRENT - running;
+
+    if (slots <= 0) return;
+
+    for (const item of queueRef.current) {
+      if (slots <= 0) break;
+      if (item.status === "pending") {
+        item.status = "uploading";
+        item.speed = "Starting...";
+        slots--;
+        syncQueue();
+        processFileItem(item.id);
       }
+    }
+  }
 
-      async function processFile(idx: number) {
-        const file = fileArray[idx];
-        const itemId = queueItems[idx].id;
-        const startTime = Date.now();
+  async function processFileItem(itemId: string) {
+    const file = filesRef.current[itemId];
+    if (!file) return;
 
-        setUploadQueue((prev) =>
-          prev.map((item) =>
-            item.id === itemId
-              ? { ...item, status: "uploading", progress: 0, speed: "0 KB/s" }
-              : item
-          )
-        );
+    const updateItem = (updates: Partial<typeof queueRef.current[0]>) => {
+      queueRef.current = queueRef.current.map(item =>
+        item.id === itemId ? { ...item, ...updates } : item
+      );
+      syncQueue();
+    };
+
+    const getItem = () => queueRef.current.find(item => item.id === itemId);
+
+    try {
+      const storageKey = `upload_session_${folderId}_${file.name}_${file.size}`;
+      const cachedUploadId = localStorage.getItem(storageKey) || undefined;
+
+      // 1. Initiate upload session
+      const initRes = await initiateUpload(
+        folderId,
+        file.name,
+        file.size,
+        file.type || "application/octet-stream",
+        cachedUploadId
+      );
+
+      const uploadId = initRes.upload_id;
+      const chunkSize = initRes.chunk_size;
+      const uploadedChunks = initRes.uploaded_chunks;
+      const totalChunks = Math.ceil(file.size / chunkSize);
+
+      updateItem({
+        uploadId,
+        totalChunks,
+        progress: totalChunks > 0 ? Math.round((uploadedChunks.length / totalChunks) * 100) : 0,
+      });
+
+      localStorage.setItem(storageKey, uploadId);
+
+      const completedChunks = new Set<number>(uploadedChunks);
+      const speedStartTime = Date.now();
+
+      // 2. Chunk loop
+      for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++) {
+        let currentItem = getItem();
+        if (!currentItem || currentItem.status !== "uploading") {
+          return;
+        }
+
+        if (completedChunks.has(chunkIndex)) {
+          continue;
+        }
+
+        const chunkBlob = file.slice(chunkIndex * chunkSize, (chunkIndex + 1) * chunkSize);
+        const controller = new AbortController();
+        abortControllersRef.current[itemId] = controller;
 
         try {
-          const newImg = await uploadImage(
-            folderId,
-            file,
+          await uploadChunk(
+            uploadId,
+            chunkIndex,
+            chunkBlob,
             (progressEvent) => {
-              const percent = Math.round(
-                (progressEvent.loaded / progressEvent.total) * 100
+              const currentChunkFraction = progressEvent.loaded / progressEvent.total;
+              const totalProgress = Math.min(
+                99,
+                Math.round(((completedChunks.size + currentChunkFraction) / totalChunks) * 100)
               );
-              const timeElapsed = (Date.now() - startTime) / 1000;
+
+              const elapsedSeconds = (Date.now() - speedStartTime) / 1000;
               let speedStr = "Calculating...";
-              if (timeElapsed > 0) {
-                const bytesPerSec = progressEvent.loaded / timeElapsed;
+              if (elapsedSeconds > 0) {
+                const uploadedInSession = (completedChunks.size - uploadedChunks.length) * chunkSize + progressEvent.loaded;
+                const bytesPerSec = uploadedInSession / elapsedSeconds;
                 if (bytesPerSec > 1024 * 1024) {
                   speedStr = `${(bytesPerSec / (1024 * 1024)).toFixed(1)} MB/s`;
                 } else {
                   speedStr = `${(bytesPerSec / 1024).toFixed(0)} KB/s`;
                 }
               }
-              setUploadQueue((prev) =>
-                prev.map((item) =>
-                  item.id === itemId
-                    ? { ...item, progress: percent, speed: speedStr }
-                    : item
-                )
-              );
-            }
+
+              updateItem({
+                progress: totalProgress,
+                speed: speedStr,
+              });
+            },
+            controller.signal
           );
 
-          results[idx] = newImg;
-          setImages((prev) => [newImg, ...prev]);
-          setTotalImages((prev) => prev + 1);
-
-          setUploadQueue((prev) =>
-            prev.map((item) =>
-              item.id === itemId
-                ? { ...item, status: "success", progress: 100 }
-                : item
-            )
-          );
-        } catch (err: unknown) {
-          const errMsg = err instanceof Error ? err.message : "Upload failed";
-          setUploadQueue((prev) =>
-            prev.map((item) =>
-              item.id === itemId
-                ? { ...item, status: "error", errorMsg: errMsg }
-                : item
-            )
-          );
+          completedChunks.add(chunkIndex);
+          delete abortControllersRef.current[itemId];
+        } catch (chunkErr: any) {
+          delete abortControllersRef.current[itemId];
+          if (chunkErr.name === "AbortError" || chunkErr.message === "Aborted") {
+            return;
+          }
+          throw chunkErr;
         }
       }
 
-      startNext();
-    });
+      // 3. Complete session
+      let currentItem = getItem();
+      if (!currentItem || currentItem.status !== "uploading") {
+        return;
+      }
 
-    // Auto-hide the upload panel after 3 seconds
-    setTimeout(() => {
-      setUploading(false);
-      setUploadQueue([]);
-    }, 3000);
+      updateItem({ progress: 99, speed: "Completing..." });
+
+      const newImg = await completeUpload(uploadId);
+      localStorage.removeItem(storageKey);
+
+      setImages((prev) => {
+        if (prev.some(img => img.id === newImg.id)) return prev;
+        return [newImg, ...prev];
+      });
+      setTotalImages((prev) => prev + 1);
+
+      updateItem({
+        status: "success",
+        progress: 100,
+        speed: "",
+      });
+
+      runQueue();
+    } catch (err: any) {
+      const errMsg = err instanceof Error ? err.message : "Upload failed";
+      updateItem({
+        status: "error",
+        errorMsg: errMsg,
+        speed: "",
+      });
+      runQueue();
+    }
   }
+
+  function handlePause(itemId: string) {
+    const item = queueRef.current.find(x => x.id === itemId);
+    if (item && (item.status === "uploading" || item.status === "pending")) {
+      item.status = "paused";
+      item.speed = "Paused";
+      const controller = abortControllersRef.current[itemId];
+      if (controller) {
+        controller.abort();
+        delete abortControllersRef.current[itemId];
+      }
+      syncQueue();
+      runQueue();
+    }
+  }
+
+  function handleResume(itemId: string) {
+    const item = queueRef.current.find(x => x.id === itemId);
+    if (item && (item.status === "paused" || item.status === "error")) {
+      item.status = "pending";
+      item.errorMsg = undefined;
+      item.speed = "Queued";
+      syncQueue();
+      runQueue();
+    }
+  }
+
+  function handleRetry(itemId: string) {
+    handleResume(itemId);
+  }
+
+  function handleClearQueue() {
+    // Abort all running uploads
+    Object.keys(abortControllersRef.current).forEach(itemId => {
+      abortControllersRef.current[itemId].abort();
+    });
+    filesRef.current = {};
+    abortControllersRef.current = {};
+    queueRef.current = [];
+    setUploading(false);
+    syncQueue();
+  }
+
 
 
   const handleDrag = (e: React.DragEvent) => {
@@ -653,49 +791,138 @@ export default function FolderPage() {
               padding: "16px 20px",
               marginBottom: 24,
               borderLeft: "4px solid var(--accent)",
+              position: "relative",
             }}
           >
-            <div style={{ fontWeight: 700, fontSize: "0.9rem", marginBottom: 12 }}>
-              Uploading {uploadQueue.length} file{uploadQueue.length !== 1 ? "s" : ""}
-              <span style={{ fontWeight: 400, fontSize: "0.78rem", color: "var(--text-muted)", marginLeft: 8 }}>
-                (max {MAX_CONCURRENT} concurrent)
-              </span>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
+              <div style={{ fontWeight: 700, fontSize: "0.9rem" }}>
+                Uploading {uploadQueue.filter(x => x.status !== "success").length} / {uploadQueue.length} file{uploadQueue.length !== 1 ? "s" : ""}
+                <span style={{ fontWeight: 400, fontSize: "0.78rem", color: "var(--text-muted)", marginLeft: 8 }}>
+                  (max {MAX_CONCURRENT} concurrent)
+                </span>
+              </div>
+              <button
+                onClick={handleClearQueue}
+                style={{
+                  background: "none",
+                  border: "none",
+                  color: "var(--text-muted)",
+                  cursor: "pointer",
+                  fontSize: "0.8rem",
+                  textDecoration: "underline",
+                }}
+              >
+                Close Panel
+              </button>
             </div>
-            <div style={{ display: "flex", flexDirection: "column", gap: 8, maxHeight: 240, overflowY: "auto" }}>
+            <div style={{ display: "flex", flexDirection: "column", gap: 8, maxHeight: 300, overflowY: "auto" }}>
               {uploadQueue.map((item) => (
                 <div
                   key={item.id}
                   style={{
-                    padding: "8px 12px",
+                    padding: "10px 14px",
                     background: "rgba(255,255,255,0.02)",
                     borderRadius: "var(--radius-sm)",
                     border: "1px solid var(--border-subtle)",
                   }}
                 >
-                  <div style={{ display: "flex", justifyContent: "space-between", fontSize: "0.8rem", marginBottom: 4 }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", fontSize: "0.8rem", marginBottom: 6 }}>
                     <span style={{ fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: "60%" }}>
                       {item.status === "success" && "✅ "}
                       {item.status === "error" && "❌ "}
+                      {item.status === "paused" && "⏸️ "}
+                      {item.status === "uploading" && "📤 "}
                       {item.status === "pending" && "⏳ "}
                       {item.fileName}
                     </span>
-                    <span style={{ color: "var(--text-muted)", flexShrink: 0 }}>
+                    <span style={{ color: "var(--text-muted)", flexShrink: 0, fontSize: "0.78rem" }}>
                       {item.status === "uploading" && `${item.progress}% (${item.speed})`}
+                      {item.status === "paused" && `Paused at ${item.progress}%`}
                       {item.status === "success" && "Done"}
                       {item.status === "error" && "Failed"}
-                      {item.status === "pending" && "Queued"}
+                      {item.status === "pending" && (item.speed || "Queued")}
                     </span>
                   </div>
-                  {item.status === "uploading" && (
-                    <div className="progress-bar" style={{ height: 4 }}>
-                      <div className="fill" style={{ width: `${item.progress}%` }} />
+                  
+                  {/* Progress Bar */}
+                  {item.status !== "success" && item.status !== "pending" && (
+                    <div className="progress-bar" style={{ height: 6, background: "rgba(255,255,255,0.05)", borderRadius: 3, overflow: "hidden", margin: "6px 0" }}>
+                      <div
+                        className="fill"
+                        style={{
+                          width: `${item.progress}%`,
+                          height: "100%",
+                          background: item.status === "error"
+                            ? "var(--danger)"
+                            : item.status === "paused"
+                            ? "#f59e0b" // Warm orange/amber for paused
+                            : "var(--accent)", // Standard theme accent for uploading
+                          transition: "width 0.3s ease",
+                        }}
+                      />
                     </div>
                   )}
+
                   {item.status === "error" && item.errorMsg && (
-                    <p style={{ fontSize: "0.72rem", color: "var(--danger)", marginTop: 2 }}>
+                    <p style={{ fontSize: "0.72rem", color: "var(--danger)", marginTop: 2, marginBottom: 6 }}>
                       {item.errorMsg}
                     </p>
                   )}
+
+                  {/* Controls */}
+                  <div style={{ display: "flex", gap: 8, marginTop: 6 }}>
+                    {(item.status === "uploading" || item.status === "pending") && (
+                      <button
+                        onClick={() => handlePause(item.id)}
+                        style={{
+                          background: "rgba(255, 255, 255, 0.05)",
+                          border: "1px solid var(--border-subtle)",
+                          color: "var(--text-secondary)",
+                          padding: "4px 8px",
+                          borderRadius: "4px",
+                          fontSize: "0.72rem",
+                          cursor: "pointer",
+                          transition: "all 0.2s ease",
+                        }}
+                      >
+                        ⏸️ Pause
+                      </button>
+                    )}
+                    {item.status === "paused" && (
+                      <button
+                        onClick={() => handleResume(item.id)}
+                        style={{
+                          background: "rgba(59, 130, 246, 0.15)",
+                          border: "1px solid rgba(59, 130, 246, 0.3)",
+                          color: "#60a5fa",
+                          padding: "4px 8px",
+                          borderRadius: "4px",
+                          fontSize: "0.72rem",
+                          cursor: "pointer",
+                          transition: "all 0.2s ease",
+                        }}
+                      >
+                        ▶️ Resume
+                      </button>
+                    )}
+                    {item.status === "error" && (
+                      <button
+                        onClick={() => handleRetry(item.id)}
+                        style={{
+                          background: "rgba(239, 68, 68, 0.15)",
+                          border: "1px solid rgba(239, 68, 68, 0.3)",
+                          color: "#f87171",
+                          padding: "4px 8px",
+                          borderRadius: "4px",
+                          fontSize: "0.72rem",
+                          cursor: "pointer",
+                          transition: "all 0.2s ease",
+                        }}
+                      >
+                        🔄 Retry
+                      </button>
+                    )}
+                  </div>
                 </div>
               ))}
             </div>
