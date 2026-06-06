@@ -37,6 +37,15 @@ class GitHubServiceError(Exception):
 class GitHubService:
     """Stateless helper – all state is passed via method arguments."""
 
+    _repo_locks: Dict[str, asyncio.Lock] = {}
+
+    @classmethod
+    def _get_repo_lock(cls, owner: str, repo: str) -> asyncio.Lock:
+        key = f"{owner}/{repo}".lower()
+        if key not in cls._repo_locks:
+            cls._repo_locks[key] = asyncio.Lock()
+        return cls._repo_locks[key]
+
     # ── Internal helpers ────────────────────────────────────────────
 
     @staticmethod
@@ -232,21 +241,23 @@ class GitHubService:
         The content is base64-encoded before sending.  When updating an
         existing file the sha of the current blob must be provided.
         """
-        body: Dict[str, Any] = {
-            "message": message,
-            "content": base64.b64encode(content_bytes).decode(),
-        }
-        if sha:
-            body["sha"] = sha
+        lock = cls._get_repo_lock(owner, repo)
+        async with lock:
+            body: Dict[str, Any] = {
+                "message": message,
+                "content": base64.b64encode(content_bytes).decode(),
+            }
+            if sha:
+                body["sha"] = sha
 
-        resp = await cls._request(
-            "PUT",
-            f"{_BASE_URL}/repos/{owner}/{repo}/contents/{path}",
-            token,
-            json_body=body,
-        )
-        cls._raise_for_status(resp, f"create_or_update_file({path})")
-        return resp.json()
+            resp = await cls._request(
+                "PUT",
+                f"{_BASE_URL}/repos/{owner}/{repo}/contents/{path}",
+                token,
+                json_body=body,
+            )
+            cls._raise_for_status(resp, f"create_or_update_file({path})")
+            return resp.json()
 
     @classmethod
     async def delete_file(
@@ -263,18 +274,20 @@ class GitHubService:
 
         DELETE /repos/{owner}/{repo}/contents/{path}
         """
-        body: Dict[str, Any] = {
-            "message": message,
-            "sha": sha,
-        }
-        resp = await cls._request(
-            "DELETE",
-            f"{_BASE_URL}/repos/{owner}/{repo}/contents/{path}",
-            token,
-            json_body=body,
-        )
-        cls._raise_for_status(resp, f"delete_file({path})")
-        return resp.json()
+        lock = cls._get_repo_lock(owner, repo)
+        async with lock:
+            body: Dict[str, Any] = {
+                "message": message,
+                "sha": sha,
+            }
+            resp = await cls._request(
+                "DELETE",
+                f"{_BASE_URL}/repos/{owner}/{repo}/contents/{path}",
+                token,
+                json_body=body,
+            )
+            cls._raise_for_status(resp, f"delete_file({path})")
+            return resp.json()
 
     @classmethod
     async def get_directory_contents(
