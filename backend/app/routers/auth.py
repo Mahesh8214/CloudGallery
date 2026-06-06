@@ -255,8 +255,8 @@ async def register(body: UserRegister, db: Session = Depends(get_db)):
         value=session_token,
         max_age=settings.JWT_EXPIRY_HOURS * 3600,
         httponly=True,
-        samesite="lax",
-        secure=False,
+        samesite="none",
+        secure=True,
         path="/",
     )
     return response
@@ -293,8 +293,8 @@ async def login_pass(body: UserLoginPass, db: Session = Depends(get_db)):
         value=session_token,
         max_age=settings.JWT_EXPIRY_HOURS * 3600,
         httponly=True,
-        samesite="lax",
-        secure=False,
+        samesite="none",
+        secure=True,
         path="/",
     )
     return response
